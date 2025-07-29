@@ -1,0 +1,10 @@
+# No subir dependencias
+node_modules/
+
+# No subir archivos de sesión (muy importante)
+auth.json
+/data/auth.json
+
+# Otros archivos temporales
+.env
+.DS_Store

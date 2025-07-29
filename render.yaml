@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: whatsapp-bot
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: ./start.sh
+    disk:
+      name: session-storage
+      mountPath: /data
+      sizeGB: 1
