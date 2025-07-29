@@ -4,6 +4,7 @@ node_modules/
 # No subir archivos de sesión (muy importante)
 auth.json
 /data/auth.json
+session/
 
 # Otros archivos temporales
 .env
