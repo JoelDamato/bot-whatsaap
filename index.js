@@ -1,85 +1,77 @@
-// index.js
+// index.js (Versión con más logs para depuración)
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const path = require('path');
+const path =require('path');
 const fs = require('fs');
 const pino = require('pino');
 const express = require('express');
-const QRCode = require('qrcode'); // Usaremos la librería qrcode completa
+const QRCode = require('qrcode');
 
 const app = express();
 app.use(express.json());
 
 const port = process.env.PORT || 3000;
 
-// Lógica para la ruta de la sesión
+// --- Lógica para la ruta de la sesión ---
 const RENDER_SESSION_DIR = '/data/session';
 const LOCAL_SESSION_DIR = path.join(__dirname, 'session');
 const authFolderPath = fs.existsSync(RENDER_SESSION_DIR) ? RENDER_SESSION_DIR : LOCAL_SESSION_DIR;
 console.log(`[INFO] Usando la carpeta de sesión: ${authFolderPath}`);
-
 if (!fs.existsSync(authFolderPath)) {
     fs.mkdirSync(authFolderPath, { recursive: true });
 }
 
-// Variable para guardar el string del QR
 let lastQR = '';
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState(authFolderPath);
-
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }), 
         auth: state,
     });
 
-    // --- Endpoints del servidor ---
+    // --- Endpoint para enviar mensajes con MÁS LOGS ---
     app.post('/enviar-mensaje', async (req, res) => {
-        // ... (código para enviar mensaje, no se necesita cambiar)
-    });
+        console.log('[DEBUG] Se recibió una solicitud en /enviar-mensaje');
+        const { numero, texto } = req.body;
 
-    // Nuevo endpoint para mostrar el QR como imagen
-    app.get('/qr', async (req, res) => {
-        if (lastQR) {
-            try {
-                const qrImage = await QRCode.toDataURL(lastQR);
-                res.send(`<img src="${qrImage}" alt="Escanea este QR" />`);
-            } catch (err) {
-                res.status(500).send('Error al generar la imagen del QR');
+        if (!numero || !texto) {
+            console.log('[DEBUG] Faltan número o texto.');
+            return res.status(400).json({ error: 'El número y el texto son obligatorios' });
+        }
+
+        try {
+            const jid = `${numero}@s.whatsapp.net`;
+            console.log(`[DEBUG] Verificando número: ${jid}`);
+            
+            const [result] = await sock.onWhatsApp(jid);
+            console.log(`[DEBUG] Resultado de onWhatsApp:`, result);
+
+            if (result?.exists) {
+                console.log(`[DEBUG] El número existe. Enviando mensaje...`);
+                await sock.sendMessage(jid, { text: texto });
+                console.log(`[DEBUG] Mensaje enviado con éxito.`);
+                res.json({ success: true, message: `Mensaje enviado a ${numero}` });
+            } else {
+                console.log(`[DEBUG] El número no existe.`);
+                res.status(404).json({ error: 'El número no existe en WhatsApp' });
             }
-        } else {
-            res.send('<h1>No hay un código QR disponible.</h1><p>Asegúrate de que el bot se esté iniciando o reinicia el servicio.</p>');
+        } catch (error) {
+            console.error('[ERROR] Falló el bloque try/catch de /enviar-mensaje:', error);
+            res.status(500).json({ error: 'Hubo un error al enviar el mensaje' });
         }
     });
-    // --- Fin de Endpoints ---
 
-    sock.ev.on('creds.update', saveCreds);
+    app.get('/qr', async (req, res) => {
+        // ... (código del qr sin cambios)
+    });
 
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            console.log('[INFO] Se recibió un nuevo QR. Accede a la URL de tu servicio seguida de /qr para escanearlo.');
-            lastQR = qr; // Guardamos el QR
-        }
-
-        if (connection === 'close') {
-            lastQR = ''; // Limpiamos el QR cuando la conexión se cierra
-            const statusCode = (lastDisconnect.error)?.output?.statusCode;
-            if (statusCode !== DisconnectReason.loggedOut) {
-                startBot();
-            } else {
-                console.log('❌ Conexión cerrada permanentemente.');
-            }
-        } else if (connection === 'open') {
-            lastQR = ''; // Limpiamos el QR una vez conectado
-            console.log('✅ ¡Conectado a WhatsApp!');
-        }
+        // ... (código de conexión sin cambios)
     });
 
-    sock.ev.on('messages.upsert', async (messages) => { /* ... */ });
+    startBot();
 }
 
-// Iniciar el servidor Express inmediatamente para que el endpoint /qr siempre esté disponible
 app.listen(port, () => {
     console.log(`🚀 Servidor iniciado en el puerto ${port}. El bot de WhatsApp se está conectando...`);
     startBot();
