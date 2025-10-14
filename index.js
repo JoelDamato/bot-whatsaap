@@ -212,7 +212,7 @@ app.post('/enviar-mensaje', async (req, res) => {
 // Endpoint para verificar el estado de la cola
 app.get('/estado-cola', (req, res) => {
     const status = messageQueue.getQueueStatus();
-    const botConectado = sock && sock.ws && sock.ws.readyState === sock.ws.OPEN;
+    const botConectado = sock && sock.ws && sock.ws.readyState === 1; // 1 = OPEN
     const qrDisponible = !!lastQR;
     
     res.json({
@@ -220,7 +220,17 @@ app.get('/estado-cola', (req, res) => {
         botConectado: botConectado,
         qrDisponible: qrDisponible,
         estado: botConectado ? 'conectado' : (qrDisponible ? 'esperando_qr' : 'desconectado'),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        debug: {
+            sockExists: !!sock,
+            wsExists: !!(sock && sock.ws),
+            wsReadyState: sock && sock.ws ? sock.ws.readyState : 'N/A',
+            wsReadyStateText: sock && sock.ws ? 
+                (sock.ws.readyState === 0 ? 'CONNECTING' : 
+                 sock.ws.readyState === 1 ? 'OPEN' : 
+                 sock.ws.readyState === 2 ? 'CLOSING' : 
+                 sock.ws.readyState === 3 ? 'CLOSED' : 'UNKNOWN') : 'N/A'
+        }
     });
 });
 
