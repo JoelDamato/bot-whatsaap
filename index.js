@@ -212,9 +212,15 @@ app.post('/enviar-mensaje', async (req, res) => {
 // Endpoint para verificar el estado de la cola
 app.get('/estado-cola', (req, res) => {
     const status = messageQueue.getQueueStatus();
+    const botConectado = sock && sock.ws && sock.ws.readyState === sock.ws.OPEN;
+    const qrDisponible = !!lastQR;
+    
     res.json({
         cola: status,
-        botConectado: sock && sock.ws.readyState === sock.ws.OPEN
+        botConectado: botConectado,
+        qrDisponible: qrDisponible,
+        estado: botConectado ? 'conectado' : (qrDisponible ? 'esperando_qr' : 'desconectado'),
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -223,12 +229,72 @@ app.get('/qr', async (req, res) => {
     if (lastQR) {
         try {
             const qrImage = await QRCode.toDataURL(lastQR);
-            res.send(`<img src="${qrImage}" alt="Escanea este código QR" style="width:300px;height:300px;"/>`);
+            res.send(`
+                <html>
+                <head>
+                    <title>QR Code - Bot WhatsApp</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background: #f5f5f5; }
+                        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+                        .qr-container { margin: 20px 0; }
+                        .instructions { margin: 20px 0; color: #666; text-align: left; }
+                        .status { background: #e8f5e8; padding: 15px; border-radius: 10px; margin: 20px 0; }
+                        .btn { background: #25D366; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>🤖 Bot WhatsApp</h1>
+                        <div class="status">
+                            <h3>✅ QR Disponible</h3>
+                            <p>Escanea el código para conectar</p>
+                        </div>
+                        <div class="qr-container">
+                            <img src="${qrImage}" alt="QR Code" style="width:300px;height:300px;border:3px solid #25D366;border-radius:10px;"/>
+                        </div>
+                        <div class="instructions">
+                            <h3>📱 Instrucciones:</h3>
+                            <ol>
+                                <li>Abre WhatsApp en tu teléfono</li>
+                                <li>Ve a <strong>Configuración</strong> → <strong>Dispositivos vinculados</strong></li>
+                                <li>Toca <strong>"Vincular un dispositivo"</strong></li>
+                                <li>Escanea este código QR</li>
+                            </ol>
+                        </div>
+                        <a href="/estado-cola" class="btn">Ver Estado del Bot</a>
+                    </div>
+                </body>
+                </html>
+            `);
         } catch (err) {
             res.status(500).send('Error al generar la imagen del QR');
         }
     } else {
-        res.send('<h1>No hay un código QR disponible.</h1><p>Si el bot está conectado, no se mostrará ningún QR.</p>');
+        res.send(`
+            <html>
+            <head>
+                <title>QR Code - Bot WhatsApp</title>
+                <style>
+                    body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background: #f5f5f5; }
+                    .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+                    .status { background: #fff3cd; padding: 15px; border-radius: 10px; margin: 20px 0; }
+                    .btn { background: #25D366; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🤖 Bot WhatsApp</h1>
+                    <div class="status">
+                        <h3>⏳ Esperando QR</h3>
+                        <p>El bot está intentando conectar con WhatsApp...</p>
+                        <p>Espera unos segundos y recarga la página.</p>
+                    </div>
+                    <a href="/estado-cola" class="btn">Ver Estado del Bot</a>
+                    <a href="/qr" class="btn">Recargar QR</a>
+                </div>
+            </body>
+            </html>
+        `);
     }
 });
 
