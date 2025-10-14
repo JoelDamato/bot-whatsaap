@@ -4,12 +4,7 @@ services:
     env: node
     plan: starter
     buildCommand: npm install
-    startCommand: npm start
-    envVars:
-      - key: RENDER
-        value: true
-      - key: PORT
-        value: 10000
+    startCommand: ./start.sh
     disk:
       name: session-storage
       mountPath: /data
