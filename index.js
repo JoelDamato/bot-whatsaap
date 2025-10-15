@@ -141,35 +141,40 @@ async function startBot() {
     console.log('[INFO] Iniciando conexión con WhatsApp...');
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-    sock = makeWASocket({
-        logger: pino({ level: 'silent' }), 
-        auth: state,
-        printQRInTerminal: false,
-        browser: ['Bot WhatsApp', 'Chrome', '1.0.0'],
-        connectTimeoutMs: 30000,
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 1000,
-        maxMsgRetryCount: 3,
-        defaultQueryTimeoutMs: 30000,
-        generateHighQualityLinkPreview: false,
-        markOnlineOnConnect: false,
-        syncFullHistory: false,
-        fireInitQueries: false,
-        shouldSyncHistoryMessage: () => false,
-        shouldIgnoreJid: () => false,
-    });
+        sock = makeWASocket({
+            logger: pino({ level: 'silent' }), 
+            auth: state,
+            printQRInTerminal: true,
+            browser: ['Bot WhatsApp', 'Chrome', '1.0.0'],
+            connectTimeoutMs: 120000, // 2 minutos
+            keepAliveIntervalMs: 30000,
+            retryRequestDelayMs: 1000,
+            maxMsgRetryCount: 3,
+            defaultQueryTimeoutMs: 120000, // 2 minutos
+            generateHighQualityLinkPreview: false,
+            markOnlineOnConnect: false,
+            syncFullHistory: false,
+            fireInitQueries: false,
+            shouldSyncHistoryMessage: () => false,
+            shouldIgnoreJid: () => false,
+            getMessage: async (key) => {
+                return null;
+            },
+        });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            console.log('[INFO] Se recibió un nuevo QR.');
-            console.log('[QR] Escanea este código con WhatsApp:');
-            console.log(qr);
-            lastQR = qr;
-        }
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect, qr } = update;
+            
+            console.log(`[DEBUG] Connection update: ${connection}`);
+            
+            if (qr) {
+                console.log('[INFO] Se recibió un nuevo QR.');
+                console.log('[QR] Escanea este código con WhatsApp:');
+                console.log(qr);
+                lastQR = qr;
+            }
 
             if (connection === 'close') {
                 lastQR = '';
@@ -192,9 +197,15 @@ async function startBot() {
                     console.log('🔄 Intentando reconectar en 10 segundos...');
                     setTimeout(() => startBot(), 10000);
                 } else {
-                    // Si nunca se conectó, no reconectar automáticamente
-                    console.log('❌ No se pudo conectar inicialmente. Verifica tu conexión a internet.');
-                    console.log('💡 Reinicia el bot manualmente si es necesario.');
+                    // Si nunca se conectó, esperar un poco más para generar QR
+                    console.log('❌ No se pudo conectar inicialmente. Esperando para generar QR...');
+                    console.log('💡 Si no aparece QR en 30 segundos, reinicia el bot.');
+                    setTimeout(() => {
+                        if (!hasEverConnected && !lastQR) {
+                            console.log('🔄 Reintentando conexión para generar QR...');
+                            startBot();
+                        }
+                    }, 30000);
                 }
             } else if (connection === 'open') {
                 lastQR = '';
