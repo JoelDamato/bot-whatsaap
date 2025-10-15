@@ -25,6 +25,7 @@ if (!fs.existsSync(sessionDir)) {
 
 let sock;
 let lastQR = '';
+let hasEverConnected = false;
 
 // --- Sistema de Cola de Mensajes ---
 class MessageQueue {
@@ -170,31 +171,38 @@ async function startBot() {
             lastQR = qr;
         }
 
-        if (connection === 'close') {
-            lastQR = '';
-            const statusCode = (lastDisconnect.error)?.output?.statusCode;
-            const reason = DisconnectReason[statusCode] || 'desconocida';
-            console.log(`🔌 Conexión cerrada, razón: ${reason}`);
-            
-            if (statusCode === DisconnectReason.loggedOut) {
-                console.log('❌ Conexión cerrada permanentemente por logout.');
-                console.log('💡 Elimina la carpeta session y reinicia para generar nuevo QR');
-            } else if (statusCode === DisconnectReason.restartRequired) {
-                console.log('🔄 Reinicio requerido, reconectando...');
-                setTimeout(() => startBot(), 5000);
-            } else if (statusCode === DisconnectReason.timedOut) {
-                console.log('⏰ Timeout de conexión, reintentando...');
-                setTimeout(() => startBot(), 10000);
-            } else {
-                console.log('🔄 Intentando reconectar en 10 segundos...');
-                setTimeout(() => startBot(), 10000);
+            if (connection === 'close') {
+                lastQR = '';
+                const statusCode = (lastDisconnect.error)?.output?.statusCode;
+                const reason = DisconnectReason[statusCode] || 'desconocida';
+                console.log(`🔌 Conexión cerrada, razón: ${reason}`);
+                
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log('❌ Conexión cerrada permanentemente por logout.');
+                    console.log('💡 Elimina la carpeta session y reinicia para generar nuevo QR');
+                    hasEverConnected = false;
+                } else if (statusCode === DisconnectReason.restartRequired) {
+                    console.log('🔄 Reinicio requerido, reconectando...');
+                    setTimeout(() => startBot(), 5000);
+                } else if (statusCode === DisconnectReason.timedOut) {
+                    console.log('⏰ Timeout de conexión, reintentando...');
+                    setTimeout(() => startBot(), 10000);
+                } else if (hasEverConnected) {
+                    // Solo reconectar si ya se había conectado antes
+                    console.log('🔄 Intentando reconectar en 10 segundos...');
+                    setTimeout(() => startBot(), 10000);
+                } else {
+                    // Si nunca se conectó, no reconectar automáticamente
+                    console.log('❌ No se pudo conectar inicialmente. Verifica tu conexión a internet.');
+                    console.log('💡 Reinicia el bot manualmente si es necesario.');
+                }
+            } else if (connection === 'open') {
+                lastQR = '';
+                hasEverConnected = true;
+                console.log('✅ ¡Bot conectado a WhatsApp!');
+            } else if (connection === 'connecting') {
+                console.log('🔄 Conectando a WhatsApp...');
             }
-        } else if (connection === 'open') {
-            lastQR = '';
-            console.log('✅ ¡Bot conectado a WhatsApp!');
-        } else if (connection === 'connecting') {
-            console.log('🔄 Conectando a WhatsApp...');
-        }
     });
 }
 
