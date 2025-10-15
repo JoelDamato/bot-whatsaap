@@ -1,5 +1,5 @@
 // index.js
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const path = require('path');
 const fs = require('fs');
 const pino = require('pino');
@@ -27,6 +27,8 @@ let sock;
 let lastQR = '';
 let hasEverConnected = false;
 let isConnecting = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 // --- Sistema de Cola de Mensajes ---
 class MessageQueue {
@@ -68,7 +70,6 @@ class MessageQueue {
             const messageData = this.queue.shift();
             await this.processMessage(messageData);
             
-            // Pequeña pausa entre mensajes para evitar rate limit
             await new Promise(resolve => setTimeout(resolve, 1500));
         }
 
@@ -82,7 +83,6 @@ class MessageQueue {
         console.log(`[COLA] Procesando mensaje ${id} (intento ${attempts + 1}/${maxAttempts})`);
 
         try {
-            // Verificar conexión
             if (!sock || !sock.user) {
                 throw new Error('Bot no conectado a WhatsApp');
             }
@@ -91,13 +91,11 @@ class MessageQueue {
                 throw new Error('WebSocket no está abierto');
             }
 
-            // Limpiar número (eliminar espacios, guiones, etc.)
             const cleanNumber = numero.replace(/\D/g, '');
             const jid = `${cleanNumber}@s.whatsapp.net`;
             
             console.log(`[COLA] Verificando existencia del número: ${cleanNumber}`);
             
-            // Verificar si el número existe en WhatsApp
             const [result] = await sock.onWhatsApp(jid);
             
             if (!result?.exists) {
@@ -106,12 +104,10 @@ class MessageQueue {
 
             console.log(`[COLA] Enviando mensaje a ${cleanNumber}...`);
             
-            // Envío del mensaje
             await sock.sendMessage(jid, { text: texto });
             
             console.log(`[COLA] ✅ Mensaje ${id} enviado exitosamente a ${cleanNumber}`);
             
-            // Enviar respuesta exitosa
             if (this.pendingResponses.has(id)) {
                 const response = this.pendingResponses.get(id);
                 response.json({ 
@@ -132,7 +128,6 @@ class MessageQueue {
             if (newAttempts < maxAttempts) {
                 console.log(`[COLA] 🔄 Reintentando mensaje ${id} en 5 segundos...`);
                 
-                // Reagregar a la cola para reintento
                 setTimeout(() => {
                     this.queue.push({
                         ...messageData,
@@ -146,7 +141,6 @@ class MessageQueue {
             } else {
                 console.error(`[COLA] ❌ Mensaje ${id} falló después de ${maxAttempts} intentos`);
                 
-                // Enviar respuesta de error
                 if (this.pendingResponses.has(id)) {
                     const response = this.pendingResponses.get(id);
                     response.status(500).json({ 
@@ -184,25 +178,25 @@ async function startBot() {
     console.log('[INFO] Iniciando conexión con WhatsApp...');
     
     try {
+        // Obtener la última versión de Baileys
+        const { version, isLatest } = await fetchLatestBaileysVersion();
+        console.log(`[INFO] Usando versión de WA: ${version.join('.')}, es la última: ${isLatest}`);
+
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
         sock = makeWASocket({
+            version,
             logger: pino({ level: 'silent' }), 
             auth: state,
-            printQRInTerminal: true,
-            browser: ['Bot WhatsApp', 'Chrome', '1.0.0'],
+            browser: ['Ubuntu', 'Chrome', '20.0.04'],
             connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 30000,
-            retryRequestDelayMs: 2000,
-            maxMsgRetryCount: 3,
             defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
+            emitOwnEvents: false,
             generateHighQualityLinkPreview: false,
-            markOnlineOnConnect: true,
             syncFullHistory: false,
-            fireInitQueries: true,
-            getMessage: async (key) => {
-                return { conversation: '' };
-            },
+            markOnlineOnConnect: false,
+            getMessage: async () => null,
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -213,34 +207,63 @@ async function startBot() {
             console.log(`[DEBUG] Connection update: ${connection || 'undefined'}`);
             
             if (qr) {
-                console.log('[INFO] ✅ Se recibió un nuevo QR.');
-                console.log('[QR] Escanea este código con WhatsApp:');
+                reconnectAttempts = 0; // Reiniciar contador si se genera QR
+                console.log('[INFO] ✅ QR Code generado!');
+                console.log('[QR] Nuevo código QR disponible');
                 console.log(qr);
                 lastQR = qr;
             }
 
             if (connection === 'close') {
                 isConnecting = false;
-                const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 
                 console.log(`🔌 Conexión cerrada, código: ${statusCode}`);
                 
                 if (statusCode === DisconnectReason.loggedOut) {
-                    console.log('❌ Sesión cerrada (logout). Elimina la carpeta session y reinicia.');
+                    console.log('❌ Sesión cerrada (logout). Limpiando sesión...');
                     hasEverConnected = false;
                     lastQR = '';
+                    reconnectAttempts = 0;
                     
-                    // Limpiar sesión
                     try {
                         if (fs.existsSync(sessionDir)) {
-                            fs.rmSync(sessionDir, { recursive: true, force: true });
-                            fs.mkdirSync(sessionDir, { recursive: true });
-                            console.log('🗑️ Sesión eliminada. Reinicia el servidor para generar nuevo QR.');
+                            const files = fs.readdirSync(sessionDir);
+                            for (const file of files) {
+                                fs.unlinkSync(path.join(sessionDir, file));
+                            }
+                            console.log('🗑️ Sesión eliminada. Reiniciando para generar nuevo QR...');
                         }
                     } catch (err) {
                         console.error('Error al limpiar sesión:', err);
                     }
+                    
+                    setTimeout(() => startBot(), 3000);
+                    
+                } else if (statusCode === 405) {
+                    console.log('❌ Error 405: No autorizado. Limpiando sesión...');
+                    lastQR = '';
+                    reconnectAttempts++;
+                    
+                    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                        console.log('⚠️ Demasiados intentos fallidos. Limpiando sesión completa...');
+                        try {
+                            if (fs.existsSync(sessionDir)) {
+                                const files = fs.readdirSync(sessionDir);
+                                for (const file of files) {
+                                    fs.unlinkSync(path.join(sessionDir, file));
+                                }
+                            }
+                        } catch (err) {
+                            console.error('Error al limpiar sesión:', err);
+                        }
+                        reconnectAttempts = 0;
+                    }
+                    
+                    console.log(`🔄 Reintentando en 10 segundos... (intento ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+                    setTimeout(() => startBot(), 10000);
+                    
                 } else if (shouldReconnect) {
                     console.log('🔄 Reconectando en 5 segundos...');
                     setTimeout(() => startBot(), 5000);
@@ -251,14 +274,15 @@ async function startBot() {
                 isConnecting = false;
                 lastQR = '';
                 hasEverConnected = true;
+                reconnectAttempts = 0;
                 console.log('✅ ¡Bot conectado a WhatsApp exitosamente!');
                 console.log(`📱 Conectado como: ${sock.user?.id || 'Desconocido'}`);
+                console.log(`📱 Nombre: ${sock.user?.name || 'N/A'}`);
             } else if (connection === 'connecting') {
                 console.log('🔄 Conectando a WhatsApp...');
             }
         });
 
-        // Manejar mensajes entrantes (opcional, para logs)
         sock.ev.on('messages.upsert', async ({ messages }) => {
             const msg = messages[0];
             if (!msg.key.fromMe && msg.message) {
@@ -289,7 +313,6 @@ app.post('/enviar-mensaje', async (req, res) => {
         });
     }
 
-    // Verificar si el bot está conectado
     if (!sock || !sock.user) {
         return res.status(503).json({ 
             success: false,
@@ -298,8 +321,44 @@ app.post('/enviar-mensaje', async (req, res) => {
         });
     }
 
-    // Agregar mensaje a la cola
     messageQueue.addMessage(numero, texto, res);
+});
+
+// Endpoint para limpiar sesión manualmente
+app.post('/limpiar-sesion', async (req, res) => {
+    try {
+        console.log('[API] Solicitud de limpieza de sesión recibida');
+        
+        if (sock) {
+            await sock.logout();
+        }
+        
+        if (fs.existsSync(sessionDir)) {
+            const files = fs.readdirSync(sessionDir);
+            for (const file of files) {
+                fs.unlinkSync(path.join(sessionDir, file));
+            }
+        }
+        
+        lastQR = '';
+        hasEverConnected = false;
+        reconnectAttempts = 0;
+        
+        console.log('[API] Sesión limpiada. Reiniciando bot...');
+        
+        setTimeout(() => startBot(), 2000);
+        
+        res.json({ 
+            success: true, 
+            message: 'Sesión limpiada. El bot se está reiniciando para generar nuevo QR.'
+        });
+    } catch (error) {
+        console.error('[API] Error al limpiar sesión:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
 });
 
 app.get('/estado-cola', (req, res) => {
@@ -314,6 +373,8 @@ app.get('/estado-cola', (req, res) => {
         qrDisponible: qrDisponible,
         estado: botConectado ? 'conectado' : (qrDisponible ? 'esperando_qr' : 'desconectado'),
         usuarioConectado: sock?.user?.id || null,
+        nombreUsuario: sock?.user?.name || null,
+        reconnectAttempts: reconnectAttempts,
         timestamp: new Date().toISOString(),
         debug: {
             sockExists: !!sock,
@@ -348,6 +409,7 @@ app.get('/qr', async (req, res) => {
                     .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
                     .status { background: #d4edda; padding: 15px; border-radius: 10px; margin: 20px 0; border: 2px solid #28a745; }
                     .btn { background: #25D366; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; border: none; cursor: pointer; }
+                    .btn-danger { background: #dc3545; }
                     .info { background: #f8f9fa; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; }
                 </style>
             </head>
@@ -357,6 +419,7 @@ app.get('/qr', async (req, res) => {
                     <div class="status">
                         <h2>✅ BOT CONECTADO</h2>
                         <p style="font-size: 18px; margin: 10px 0;">📱 ${sock.user.id}</p>
+                        <p style="font-size: 14px; color: #155724;">👤 ${sock.user.name || 'Sin nombre'}</p>
                         <p style="color: #155724;">El bot está listo para enviar mensajes</p>
                     </div>
                     <div class="info">
@@ -367,6 +430,7 @@ app.get('/qr', async (req, res) => {
                     </div>
                     <a href="/estado-cola" class="btn">Ver Estado Detallado</a>
                     <button onclick="location.reload()" class="btn" style="background: #007bff;">Actualizar</button>
+                    <button onclick="if(confirm('¿Desconectar el bot y generar nuevo QR?')) fetch('/limpiar-sesion', {method: 'POST'}).then(() => setTimeout(() => location.reload(), 3000))" class="btn btn-danger">Desconectar</button>
                 </div>
             </body>
             </html>
@@ -389,7 +453,6 @@ app.get('/qr', async (req, res) => {
                         .btn { background: #25D366; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; }
                     </style>
                     <script>
-                        // Auto-refresh cada 30 segundos
                         setTimeout(() => location.reload(), 30000);
                     </script>
                 </head>
@@ -399,7 +462,7 @@ app.get('/qr', async (req, res) => {
                         <div class="status">
                             <h3>✅ QR Disponible</h3>
                             <p>Escanea el código para conectar</p>
-                            <p style="font-size: 12px; color: #888;">La página se actualizará automáticamente</p>
+                            <p style="font-size: 12px; color: #888;">La página se actualizará en 30 segundos</p>
                         </div>
                         <div class="qr-container">
                             <img src="${qrImage}" alt="QR Code" style="width:300px;height:300px;border:3px solid #25D366;border-radius:10px;"/>
@@ -435,11 +498,11 @@ app.get('/qr', async (req, res) => {
                     .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
                     .status { background: #fff3cd; padding: 15px; border-radius: 10px; margin: 20px 0; }
                     .btn { background: #25D366; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px; }
+                    .btn-danger { background: #dc3545; }
                     .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #25D366; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
                     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
                 </style>
                 <script>
-                    // Auto-refresh cada 10 segundos
                     setTimeout(() => location.reload(), 10000);
                 </script>
             </head>
@@ -451,10 +514,12 @@ app.get('/qr', async (req, res) => {
                         <div class="spinner"></div>
                         <p>El bot está intentando conectar con WhatsApp...</p>
                         <p>Espera unos segundos, la página se recargará automáticamente.</p>
-                        <p style="font-size: 12px; color: #888; margin-top: 15px;">Si después de 1 minuto no aparece el QR, verifica los logs del servidor.</p>
+                        <p style="font-size: 12px; color: #888; margin-top: 15px;">Intentos de reconexión: ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}</p>
+                        <p style="font-size: 12px; color: #888;">Si no aparece el QR después de varios intentos, limpia la sesión.</p>
                     </div>
                     <a href="/estado-cola" class="btn">Ver Estado del Bot</a>
                     <a href="/qr" class="btn" style="background: #007bff;">Recargar Ahora</a>
+                    <button onclick="if(confirm('¿Limpiar sesión y reiniciar?')) fetch('/limpiar-sesion', {method: 'POST'}).then(() => setTimeout(() => location.reload(), 3000))" class="btn btn-danger">Limpiar Sesión</button>
                 </div>
             </body>
             </html>
@@ -462,16 +527,15 @@ app.get('/qr', async (req, res) => {
     }
 });
 
-// Ruta de health check
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         uptime: process.uptime(),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        connected: !!(sock && sock.user)
     });
 });
 
-// Ruta principal
 app.get('/', (req, res) => {
     res.redirect('/qr');
 });
