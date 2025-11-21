@@ -325,13 +325,25 @@ app.post('/enviar-mensaje', (req, res) => {
 
 app.post('/crear-grupo', async (req, res) => {
     try {
-        const { numeros, imagen } = req.body;
+        const { numeros, imagen, nombre } = req.body;
 
         // Validar que el bot esté conectado
         if (!sock || !sock.user) {
             return res.status(503).json({ 
                 success: false, 
                 error: 'Bot desconectado. Escaneá el QR.' 
+            });
+        }
+
+        // Validar nombre del grupo
+        const nombreGrupo = (nombre && typeof nombre === 'string' && nombre.trim().length > 0) 
+            ? nombre.trim() 
+            : 'test grupos';
+
+        if (nombreGrupo.length > 25) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'El nombre del grupo no puede tener más de 25 caracteres' 
             });
         }
 
@@ -414,11 +426,11 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Crear el grupo con el nombre "test grupos"
+        // Crear el grupo con el nombre proporcionado
         let grupoId;
         try {
-            grupoId = await sock.groupCreate('test grupos', numerosValidos);
-            console.log(`[GRUPO] ✅ Grupo creado: ${grupoId}`);
+            grupoId = await sock.groupCreate(nombreGrupo, numerosValidos);
+            console.log(`[GRUPO] ✅ Grupo creado: ${grupoId} con nombre: ${nombreGrupo}`);
         } catch (createError) {
             console.error('[GRUPO] ❌ Error al crear el grupo:', createError);
             
@@ -436,11 +448,22 @@ app.post('/crear-grupo', async (req, res) => {
 
         // Asegurar que el nombre esté establecido (por si acaso)
         try {
-            await sock.groupUpdateSubject(grupoId, 'test grupos');
+            await sock.groupUpdateSubject(grupoId, nombreGrupo);
         } catch (nameError) {
             console.log(`[GRUPO] ⚠️ El nombre ya estaba establecido o hubo un error menor:`, nameError.message);
             // No es crítico, continuamos
         }
+
+        // Guardar en historial (antes de intentar la imagen para tener el objeto disponible)
+        const grupoInfo = {
+            grupoId: grupoId,
+            nombre: nombreGrupo,
+            participantesAgregados: numerosValidos.length,
+            numerosInvalidos: numerosInvalidos.length > 0 ? numerosInvalidos : [],
+            timestamp: new Date().toISOString(),
+            tieneImagen: !!imagen,
+            status: 'creado'
+        };
 
         // Si se proporciona una imagen, establecerla como foto del grupo
         if (imagen) {
@@ -458,9 +481,13 @@ app.post('/crear-grupo', async (req, res) => {
                     try {
                         const response = await axios.get(imagen, { 
                             responseType: 'arraybuffer',
-                            timeout: 10000, // 10 segundos de timeout
+                            timeout: 15000, // 15 segundos de timeout
                             maxContentLength: 5 * 1024 * 1024, // Máximo 5MB
-                            validateStatus: (status) => status === 200
+                            maxBodyLength: 5 * 1024 * 1024,
+                            validateStatus: (status) => status === 200,
+                            headers: {
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                            }
                         });
                         imageBuffer = Buffer.from(response.data);
                         
@@ -468,8 +495,16 @@ app.post('/crear-grupo', async (req, res) => {
                         if (imageBuffer.length === 0) {
                             throw new Error('La imagen descargada está vacía');
                         }
+                        
+                        // Validar tamaño mínimo (al menos 100 bytes)
+                        if (imageBuffer.length < 100) {
+                            throw new Error('La imagen descargada es demasiado pequeña');
+                        }
+                        
+                        console.log(`[GRUPO] Imagen descargada: ${imageBuffer.length} bytes`);
                     } catch (downloadError) {
-                        throw new Error(`Error al descargar imagen: ${downloadError.message}`);
+                        console.error(`[GRUPO] Error detallado al descargar:`, downloadError);
+                        throw new Error(`Error al descargar imagen: ${downloadError.message || downloadError.toString()}`);
                     }
                 } 
                 // Si es base64, convertirla
@@ -502,29 +537,23 @@ app.post('/crear-grupo', async (req, res) => {
                 try {
                     await sock.updateProfilePicture(grupoId, imageBuffer);
                     console.log(`[GRUPO] ✅ Foto del grupo establecida`);
+                    grupoInfo.imagenEstablecida = true;
                 } catch (picError) {
                     throw new Error(`Error al establecer foto del grupo: ${picError.message}`);
                 }
             } catch (imgError) {
-                console.error(`[GRUPO] ⚠️ Error al establecer imagen:`, imgError.message);
+                console.error(`[GRUPO] ⚠️ Error al establecer imagen:`, imgError);
                 // No fallar la creación del grupo si la imagen falla, pero lo registramos
+                const errorMsg = imgError.message || imgError.toString();
+                grupoInfo.errorImagen = errorMsg;
+                grupoInfo.imagenEstablecida = false;
                 await sendDiscordNotification('warning', 'Grupo creado pero error con imagen', {
                     'Grupo ID': grupoId,
-                    'Error imagen': imgError.message
+                    'Error imagen': errorMsg,
+                    'URL/Base64': imagen.substring(0, 100)
                 });
             }
         }
-
-        // Guardar en historial
-        const grupoInfo = {
-            grupoId: grupoId,
-            nombre: 'test grupos',
-            participantesAgregados: numerosValidos.length,
-            numerosInvalidos: numerosInvalidos.length > 0 ? numerosInvalidos : [],
-            timestamp: new Date().toISOString(),
-            tieneImagen: !!imagen,
-            status: 'creado'
-        };
 
         gruposHistory.unshift(grupoInfo);
         if (gruposHistory.length > MAX_GROUPS_HISTORY) {
@@ -957,6 +986,18 @@ app.get('/grupos', async (req, res) => {
 
                     <form id="crearGrupoForm">
                         <div class="form-group">
+                            <label for="nombre">Nombre del Grupo</label>
+                            <input 
+                                type="text" 
+                                id="nombre" 
+                                name="nombre" 
+                                placeholder="test grupos"
+                                maxlength="25"
+                            />
+                            <small>Nombre del grupo (máximo 25 caracteres). Si está vacío, se usará "test grupos".</small>
+                        </div>
+
+                        <div class="form-group">
                             <label for="numeros">Números de Teléfono (máximo 10)</label>
                             <textarea 
                                 id="numeros" 
@@ -975,7 +1016,7 @@ app.get('/grupos', async (req, res) => {
                                 name="imagen" 
                                 placeholder="https://ejemplo.com/imagen.jpg"
                             />
-                            <small>URL de la imagen para el grupo o base64.</small>
+                            <small>URL de la imagen para el grupo (debe ser accesible públicamente) o base64.</small>
                         </div>
 
                         <button type="submit" class="btn btn-success" ${!botConectado ? 'disabled' : ''}>
@@ -1057,8 +1098,13 @@ app.get('/grupos', async (req, res) => {
                                         <strong>Estado:</strong> <span style="color: #10b981;">✅ \${grupo.status}</span>
                                     </div>
                                     <div class="info-badge">
-                                        <strong>Imagen:</strong> \${grupo.tieneImagen ? '✅ Sí' : '❌ No'}
+                                        <strong>Imagen:</strong> \${grupo.imagenEstablecida ? '✅ Sí' : (grupo.tieneImagen ? '⚠️ Error' : '❌ No')}
                                     </div>
+                                    \${grupo.errorImagen ? \`
+                                        <div class="info-badge" style="grid-column: span 2; background: #fee2e2; color: #991b1b;">
+                                            <strong>⚠️ Error imagen:</strong> \${grupo.errorImagen}
+                                        </div>
+                                    \` : ''}
                                     \${grupo.numerosInvalidos && grupo.numerosInvalidos.length > 0 ? \`
                                         <div class="info-badge" style="grid-column: span 2; background: #fee2e2; color: #991b1b;">
                                             <strong>⚠️ Números inválidos:</strong> \${grupo.numerosInvalidos.join(', ')}
@@ -1088,6 +1134,7 @@ app.get('/grupos', async (req, res) => {
             document.getElementById('crearGrupoForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
 
+                const nombre = document.getElementById('nombre').value.trim();
                 const numerosText = document.getElementById('numeros').value.trim();
                 const imagen = document.getElementById('imagen').value.trim();
 
@@ -1123,6 +1170,7 @@ app.get('/grupos', async (req, res) => {
                             'Content-Type': 'application/json'
                         },
                         body: JSON.stringify({
+                            nombre: nombre || undefined,
                             numeros: numeros,
                             imagen: imagen || undefined
                         })
