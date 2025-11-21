@@ -6,6 +6,7 @@ const pino = require('pino');
 const express = require('express');
 const QRCode = require('qrcode');
 const axios = require('axios');
+const sharp = require('sharp');
 
 const app = express();
 app.use(express.json());
@@ -481,12 +482,12 @@ app.post('/crear-grupo', async (req, res) => {
                     try {
                         const response = await axios.get(imagen, { 
                             responseType: 'arraybuffer',
-                            timeout: 15000, // 15 segundos de timeout
+                            timeout: 20000, // 20 segundos de timeout (aumentado)
                             maxContentLength: 5 * 1024 * 1024, // Máximo 5MB
                             maxBodyLength: 5 * 1024 * 1024,
                             validateStatus: (status) => status === 200,
                             headers: {
-                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                             }
                         });
                         imageBuffer = Buffer.from(response.data);
@@ -504,7 +505,17 @@ app.post('/crear-grupo', async (req, res) => {
                         console.log(`[GRUPO] Imagen descargada: ${imageBuffer.length} bytes`);
                     } catch (downloadError) {
                         console.error(`[GRUPO] Error detallado al descargar:`, downloadError);
-                        throw new Error(`Error al descargar imagen: ${downloadError.message || downloadError.toString()}`);
+                        
+                        // Manejar errores específicos
+                        if (downloadError.code === 'ECONNABORTED' || downloadError.message.includes('timeout') || downloadError.response?.status === 408) {
+                            throw new Error('Timeout al descargar la imagen. La URL puede estar muy lenta o inaccesible. Intenta con otra URL.');
+                        } else if (downloadError.response?.status === 404) {
+                            throw new Error('La imagen no se encontró en la URL proporcionada (404)');
+                        } else if (downloadError.response?.status >= 500) {
+                            throw new Error(`Error del servidor al descargar la imagen (${downloadError.response.status})`);
+                        } else {
+                            throw new Error(`Error al descargar imagen: ${downloadError.message || downloadError.toString()}`);
+                        }
                     }
                 } 
                 // Si es base64, convertirla
@@ -533,13 +544,42 @@ app.post('/crear-grupo', async (req, res) => {
                     }
                 }
 
-                // Establecer la foto del grupo
+                // Procesar la imagen con sharp antes de establecerla
                 try {
-                    await sock.updateProfilePicture(grupoId, imageBuffer);
+                    console.log(`[GRUPO] Procesando imagen con sharp...`);
+                    
+                    // Redimensionar y optimizar la imagen para WhatsApp
+                    // WhatsApp recomienda imágenes cuadradas de 640x640 píxeles
+                    const processedImage = await sharp(imageBuffer)
+                        .resize(640, 640, {
+                            fit: 'cover',
+                            position: 'center'
+                        })
+                        .jpeg({ quality: 85 }) // Convertir a JPEG con buena calidad
+                        .toBuffer();
+                    
+                    console.log(`[GRUPO] Imagen procesada: ${processedImage.length} bytes (original: ${imageBuffer.length} bytes)`);
+                    
+                    // Establecer la foto del grupo con la imagen procesada
+                    await sock.updateProfilePicture(grupoId, processedImage);
                     console.log(`[GRUPO] ✅ Foto del grupo establecida`);
                     grupoInfo.imagenEstablecida = true;
                 } catch (picError) {
-                    throw new Error(`Error al establecer foto del grupo: ${picError.message}`);
+                    console.error(`[GRUPO] Error al procesar/establecer imagen:`, picError);
+                    
+                    // Si sharp falla, intentar con la imagen original
+                    if (picError.message.includes('sharp') || picError.message.includes('processing')) {
+                        console.log(`[GRUPO] Intentando con imagen original sin procesar...`);
+                        try {
+                            await sock.updateProfilePicture(grupoId, imageBuffer);
+                            console.log(`[GRUPO] ✅ Foto del grupo establecida (sin procesar)`);
+                            grupoInfo.imagenEstablecida = true;
+                        } catch (fallbackError) {
+                            throw new Error(`Error al establecer foto del grupo: ${fallbackError.message}. Asegúrate de que la imagen sea válida.`);
+                        }
+                    } else {
+                        throw new Error(`Error al establecer foto del grupo: ${picError.message}`);
+                    }
                 }
             } catch (imgError) {
                 console.error(`[GRUPO] ⚠️ Error al establecer imagen:`, imgError);
