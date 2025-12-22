@@ -1,4 +1,4 @@
-// index.js
+// index.js - WhatsApp Bot Mejorado con seguimiento de estados
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const path = require('path');
 const fs = require('fs');
@@ -13,17 +13,17 @@ app.use(express.json());
 
 const port = process.env.PORT || 3000;
 
-// Discord Webhook URL
-const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1440761165906051184/xpk8PxG-GBaqAhDAA8i5vfFpH-w_CLrc1CGySAMSUHtaPRbLXXaxxsvhkUtizGIKSsbK';
+// Discord Webhook URL - MOVER A VARIABLE DE ENTORNO
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1440761165906051184/xpk8PxG-GBaqAhDAA8i5vfFpH-w_CLrc1CGySAMSUHtaPRbLXXaxxsvhkUtizGIKSsbK';
 
 // --- Función para enviar notificaciones a Discord ---
 async function sendDiscordNotification(type, message, details = {}) {
     try {
         const colors = {
-            error: 15158332, // Rojo
-            warning: 16776960, // Amarillo
-            success: 3066993, // Verde
-            info: 3447003 // Azul
+            error: 15158332,
+            warning: 16776960,
+            success: 3066993,
+            info: 3447003
         };
 
         const embed = {
@@ -63,22 +63,26 @@ let lastQR = '';
 let hasEverConnected = false;
 let isConnecting = false;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
+const MAX_RECONNECT_ATTEMPTS = 10;
 
-// Historial de mensajes enviados
+// Historial de mensajes enviados con estados mejorados
 const sentMessagesHistory = [];
-const MAX_HISTORY = 100;
+const MAX_HISTORY = 500;
 
 // Historial de grupos creados
 const gruposHistory = [];
-const MAX_GROUPS_HISTORY = 50;
+const MAX_GROUPS_HISTORY = 100;
 
-// --- Sistema de Cola de Mensajes ---
+// Map para tracking de estados de mensajes
+const messageStatusMap = new Map();
+
+// --- Sistema de Cola de Mensajes Mejorado ---
 class MessageQueue {
     constructor() {
         this.queue = [];
         this.processing = false;
         this.pendingResponses = new Map();
+        this.maxConcurrent = 1;
     }
 
     async addMessage(numero, texto, res) {
@@ -87,13 +91,26 @@ class MessageQueue {
             texto,
             res,
             attempts: 0,
-            maxAttempts: 3,
+            maxAttempts: 5,
             id: Date.now() + Math.random(),
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            status: 'en_cola'
         };
         
         this.queue.push(messageData);
         this.pendingResponses.set(messageData.id, res);
+        
+        // Agregar al historial inmediatamente
+        sentMessagesHistory.unshift({
+            numero: numero.replace(/\D/g, ''),
+            texto: texto.substring(0, 100) + (texto.length > 100 ? '...' : ''),
+            timestamp: messageData.timestamp,
+            id: messageData.id,
+            status: 'en_cola',
+            statusIcon: '⏳',
+            statusText: 'En cola'
+        });
+        
         console.log(`[COLA] Mensaje agregado a la cola. Total en cola: ${this.queue.length}`);
         
         if (!this.processing) {
@@ -110,7 +127,9 @@ class MessageQueue {
         while (this.queue.length > 0) {
             const messageData = this.queue.shift();
             await this.processMessage(messageData);
-            await new Promise(resolve => setTimeout(resolve, 1500));
+            
+            // Delay de 3 segundos entre mensajes para evitar rate limiting
+            await new Promise(resolve => setTimeout(resolve, 3000));
         }
 
         this.processing = false;
@@ -122,6 +141,9 @@ class MessageQueue {
 
         console.log(`[COLA] Procesando mensaje ${id} (intento ${attempts + 1}/${maxAttempts})`);
 
+        // Actualizar estado a "enviando"
+        this.updateMessageStatus(id, 'enviando', '📤', 'Enviando');
+
         try {
             if (!sock || !sock.user) {
                 throw new Error('Bot no conectado a WhatsApp');
@@ -130,38 +152,49 @@ class MessageQueue {
             const cleanNumber = numero.replace(/\D/g, '');
             const jid = `${cleanNumber}@s.whatsapp.net`;
 
+            // Verificar que el número existe
             const [result] = await sock.onWhatsApp(jid);
             if (!result?.exists) {
                 throw new Error(`El número ${cleanNumber} no existe en WhatsApp`);
             }
 
-            await sock.sendMessage(jid, { text: texto });
+            // Delay antes de enviar
+            await new Promise(resolve => setTimeout(resolve, 2000));
 
-            console.log(`[COLA] ✅ Mensaje enviado a ${cleanNumber}`);
-
-            // Guardar en historial
-            sentMessagesHistory.unshift({
-                numero: cleanNumber,
-                texto: texto.substring(0, 100) + (texto.length > 100 ? '...' : ''),
-                timestamp: new Date().toISOString(),
-                id,
-                status: 'enviado'
+            // Enviar mensaje
+            const sendResult = await sock.sendMessage(jid, { 
+                text: texto 
+            }, {
+                ephemeralExpiration: 0
             });
 
-            if (sentMessagesHistory.length > MAX_HISTORY) {
-                sentMessagesHistory.pop();
-            }
+            // Guardar el messageId para tracking
+            const messageId = sendResult?.key?.id;
+            messageStatusMap.set(messageId, id);
+
+            console.log(`[COLA] ✅ Mensaje enviado a ${cleanNumber}`, sendResult);
+
+            // Actualizar estado a "enviado"
+            this.updateMessageStatus(id, 'enviado', '✅', 'Enviado', messageId);
+
+            // Esperar un momento para confirmación
+            await new Promise(resolve => setTimeout(resolve, 1000));
 
             if (this.pendingResponses.has(id)) {
                 const response = this.pendingResponses.get(id);
-                response.json({ success: true, message: `Mensaje enviado a ${cleanNumber}`, queueId: id });
+                response.json({ 
+                    success: true, 
+                    message: `Mensaje enviado a ${cleanNumber}`, 
+                    queueId: id,
+                    messageId: messageId,
+                    status: 'enviado'
+                });
                 this.pendingResponses.delete(id);
             }
 
         } catch (error) {
             console.error(`[COLA] ❌ Error mensaje ${id}:`, error.message);
 
-            // Notificar error crítico a Discord
             if (error.message.includes('no conectado')) {
                 await sendDiscordNotification('error', 'Error al enviar mensaje', {
                     'Error': error.message,
@@ -173,31 +206,53 @@ class MessageQueue {
             const newAttempts = attempts + 1;
 
             if (newAttempts < maxAttempts) {
+                console.log(`[COLA] 🔄 Reintentando mensaje ${id} en 10 segundos...`);
+                
+                // Actualizar estado a "reintentando"
+                this.updateMessageStatus(id, 'reintentando', '🔄', `Reintentando (${newAttempts}/${maxAttempts})`);
+                
                 setTimeout(() => {
                     this.queue.push({ ...messageData, attempts: newAttempts });
                     if (!this.processing) this.processQueue();
-                }, 5000);
+                }, 10000);
             } else {
-                // Guardar error en historial
-                sentMessagesHistory.unshift({
-                    numero: numero.replace(/\D/g, ''),
-                    texto: texto.substring(0, 100) + (texto.length > 100 ? '...' : ''),
-                    timestamp: new Date().toISOString(),
-                    id,
-                    status: 'error',
-                    error: error.message
-                });
-
-                if (sentMessagesHistory.length > MAX_HISTORY) {
-                    sentMessagesHistory.pop();
-                }
+                // Error final
+                this.updateMessageStatus(id, 'error', '❌', 'Error al enviar', null, error.message);
 
                 if (this.pendingResponses.has(id)) {
                     const response = this.pendingResponses.get(id);
-                    response.status(500).json({ success: false, error: error.message, queueId: id });
+                    response.status(500).json({ 
+                        success: false, 
+                        error: error.message, 
+                        queueId: id,
+                        status: 'error'
+                    });
                     this.pendingResponses.delete(id);
                 }
             }
+        }
+    }
+
+    updateMessageStatus(id, status, icon, statusText, messageId = null, error = null) {
+        const messageIndex = sentMessagesHistory.findIndex(msg => msg.id === id);
+        
+        if (messageIndex !== -1) {
+            sentMessagesHistory[messageIndex].status = status;
+            sentMessagesHistory[messageIndex].statusIcon = icon;
+            sentMessagesHistory[messageIndex].statusText = statusText;
+            sentMessagesHistory[messageIndex].lastUpdate = new Date().toISOString();
+            
+            if (messageId) {
+                sentMessagesHistory[messageIndex].messageId = messageId;
+            }
+            
+            if (error) {
+                sentMessagesHistory[messageIndex].error = error;
+            }
+        }
+
+        if (sentMessagesHistory.length > MAX_HISTORY) {
+            sentMessagesHistory.pop();
         }
     }
 
@@ -227,6 +282,14 @@ async function startBot() {
             logger: pino({ level: 'silent' }),
             auth: state,
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            markOnlineOnConnect: true,
+            syncFullHistory: false,
+            defaultQueryTimeoutMs: 60000,
+            getMessage: async (key) => {
+                return { conversation: '' }
+            },
+            retryRequestDelayMs: 250,
+            maxMsgRetryCount: 3,
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -261,7 +324,6 @@ async function startBot() {
             if (connection === 'close') {
                 isConnecting = false;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
                 console.log(`[INFO] Conexión cerrada. Código: ${statusCode}`);
 
@@ -286,6 +348,27 @@ async function startBot() {
                     });
 
                     setTimeout(startBot, 5000);
+                }
+            }
+        });
+
+        // Escuchar actualizaciones de mensajes para tracking de estado
+        sock.ev.on('messages.update', async (updates) => {
+            for (const update of updates) {
+                const messageId = update.key.id;
+                const internalId = messageStatusMap.get(messageId);
+                
+                if (internalId) {
+                    // Actualizar estado según el update
+                    if (update.update.status === 3) {
+                        // Entregado
+                        messageQueue.updateMessageStatus(internalId, 'entregado', '✅✅', 'Entregado', messageId);
+                        console.log(`[STATUS] Mensaje ${messageId} entregado`);
+                    } else if (update.update.status === 4) {
+                        // Leído
+                        messageQueue.updateMessageStatus(internalId, 'leido', '✅✅✅', 'Leído', messageId);
+                        console.log(`[STATUS] Mensaje ${messageId} leído`);
+                    }
                 }
             }
         });
@@ -328,7 +411,6 @@ app.post('/crear-grupo', async (req, res) => {
     try {
         const { numeros, imagen, nombre } = req.body;
 
-        // Validar que el bot esté conectado
         if (!sock || !sock.user) {
             return res.status(503).json({ 
                 success: false, 
@@ -336,7 +418,6 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Validar nombre del grupo
         const nombreGrupo = (nombre && typeof nombre === 'string' && nombre.trim().length > 0) 
             ? nombre.trim() 
             : 'test grupos';
@@ -348,7 +429,6 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Validar que se envíen números
         if (!numeros || !Array.isArray(numeros) || numeros.length === 0) {
             return res.status(400).json({ 
                 success: false, 
@@ -356,7 +436,6 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Validar máximo 10 números
         if (numeros.length > 10) {
             return res.status(400).json({ 
                 success: false, 
@@ -364,7 +443,6 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Validar que todos los números sean strings válidos
         const numerosInvalidosFormato = numeros.filter(num => 
             typeof num !== 'string' || num.trim().length === 0
         );
@@ -378,7 +456,6 @@ app.post('/crear-grupo', async (req, res) => {
 
         console.log(`[GRUPO] Creando grupo con ${numeros.length} participantes...`);
 
-        // Limpiar y formatear números
         const numerosLimpios = numeros.map(num => {
             const clean = num.replace(/\D/g, '');
             if (clean.length < 10) {
@@ -387,7 +464,6 @@ app.post('/crear-grupo', async (req, res) => {
             return `${clean}@s.whatsapp.net`;
         });
 
-        // Verificar que los números existan en WhatsApp
         let verificaciones;
         try {
             verificaciones = await Promise.all(
@@ -405,7 +481,6 @@ app.post('/crear-grupo', async (req, res) => {
         const numerosInvalidos = [];
 
         verificaciones.forEach((result, index) => {
-            // onWhatsApp puede devolver un array o directamente el resultado
             const checkResult = Array.isArray(result) ? result[0] : result;
             if (checkResult?.exists) {
                 numerosValidos.push(numerosLimpios[index]);
@@ -427,7 +502,6 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Crear el grupo con el nombre proporcionado
         let grupoId;
         try {
             grupoId = await sock.groupCreate(nombreGrupo, numerosValidos);
@@ -447,15 +521,12 @@ app.post('/crear-grupo', async (req, res) => {
             });
         }
 
-        // Asegurar que el nombre esté establecido (por si acaso)
         try {
             await sock.groupUpdateSubject(grupoId, nombreGrupo);
         } catch (nameError) {
-            console.log(`[GRUPO] ⚠️ El nombre ya estaba establecido o hubo un error menor:`, nameError.message);
-            // No es crítico, continuamos
+            console.log(`[GRUPO] ⚠️ El nombre ya estaba establecido:`, nameError.message);
         }
 
-        // Guardar en historial (antes de intentar la imagen para tener el objeto disponible)
         const grupoInfo = {
             grupoId: grupoId,
             nombre: nombreGrupo,
@@ -466,131 +537,77 @@ app.post('/crear-grupo', async (req, res) => {
             status: 'creado'
         };
 
-        // Si se proporciona una imagen, establecerla como foto del grupo
         if (imagen) {
             try {
                 let imageBuffer;
                 
-                // Validar que la imagen sea un string
                 if (typeof imagen !== 'string' || imagen.trim().length === 0) {
                     throw new Error('La imagen debe ser una URL o string base64 válido');
                 }
                 
-                // Si es una URL, descargarla
                 if (imagen.startsWith('http://') || imagen.startsWith('https://')) {
                     console.log(`[GRUPO] Descargando imagen desde URL: ${imagen}`);
                     try {
                         const response = await axios.get(imagen, { 
                             responseType: 'arraybuffer',
-                            timeout: 20000, // 20 segundos de timeout (aumentado)
-                            maxContentLength: 5 * 1024 * 1024, // Máximo 5MB
-                            maxBodyLength: 5 * 1024 * 1024,
-                            validateStatus: (status) => status === 200,
+                            timeout: 30000,
+                            maxContentLength: 10 * 1024 * 1024,
+                            maxBodyLength: 10 * 1024 * 1024,
                             headers: {
-                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                             }
                         });
                         imageBuffer = Buffer.from(response.data);
                         
-                        // Validar que sea una imagen válida
                         if (imageBuffer.length === 0) {
                             throw new Error('La imagen descargada está vacía');
                         }
                         
-                        // Validar tamaño mínimo (al menos 100 bytes)
-                        if (imageBuffer.length < 100) {
-                            throw new Error('La imagen descargada es demasiado pequeña');
-                        }
-                        
                         console.log(`[GRUPO] Imagen descargada: ${imageBuffer.length} bytes`);
                     } catch (downloadError) {
-                        console.error(`[GRUPO] Error detallado al descargar:`, downloadError);
-                        
-                        // Manejar errores específicos
-                        if (downloadError.code === 'ECONNABORTED' || downloadError.message.includes('timeout') || downloadError.response?.status === 408) {
-                            throw new Error('Timeout al descargar la imagen. La URL puede estar muy lenta o inaccesible. Intenta con otra URL.');
-                        } else if (downloadError.response?.status === 404) {
-                            throw new Error('La imagen no se encontró en la URL proporcionada (404)');
-                        } else if (downloadError.response?.status >= 500) {
-                            throw new Error(`Error del servidor al descargar la imagen (${downloadError.response.status})`);
-                        } else {
-                            throw new Error(`Error al descargar imagen: ${downloadError.message || downloadError.toString()}`);
-                        }
+                        throw new Error(`Error al descargar imagen: ${downloadError.message}`);
                     }
                 } 
-                // Si es base64, convertirla
                 else if (imagen.startsWith('data:image')) {
-                    console.log(`[GRUPO] Procesando imagen base64`);
-                    try {
-                        const base64Data = imagen.split(',')[1] || imagen;
-                        imageBuffer = Buffer.from(base64Data, 'base64');
-                        
-                        if (imageBuffer.length === 0) {
-                            throw new Error('La imagen base64 está vacía o es inválida');
-                        }
-                    } catch (base64Error) {
-                        throw new Error(`Error al procesar imagen base64: ${base64Error.message}`);
-                    }
+                    const base64Data = imagen.split(',')[1] || imagen;
+                    imageBuffer = Buffer.from(base64Data, 'base64');
                 }
-                // Si es base64 sin prefijo
                 else {
-                    try {
-                        imageBuffer = Buffer.from(imagen, 'base64');
-                        if (imageBuffer.length === 0) {
-                            throw new Error('La imagen base64 está vacía o es inválida');
-                        }
-                    } catch (base64Error) {
-                        throw new Error(`Error al procesar imagen base64: ${base64Error.message}`);
-                    }
+                    imageBuffer = Buffer.from(imagen, 'base64');
                 }
 
-                // Procesar la imagen con sharp antes de establecerla
                 try {
                     console.log(`[GRUPO] Procesando imagen con sharp...`);
                     
-                    // Redimensionar y optimizar la imagen para WhatsApp
-                    // WhatsApp recomienda imágenes cuadradas de 640x640 píxeles
                     const processedImage = await sharp(imageBuffer)
                         .resize(640, 640, {
                             fit: 'cover',
                             position: 'center'
                         })
-                        .jpeg({ quality: 85 }) // Convertir a JPEG con buena calidad
+                        .jpeg({ 
+                            quality: 90,
+                            mozjpeg: true 
+                        })
                         .toBuffer();
                     
-                    console.log(`[GRUPO] Imagen procesada: ${processedImage.length} bytes (original: ${imageBuffer.length} bytes)`);
+                    console.log(`[GRUPO] Imagen procesada: ${processedImage.length} bytes`);
                     
-                    // Establecer la foto del grupo con la imagen procesada
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    
                     await sock.updateProfilePicture(grupoId, processedImage);
                     console.log(`[GRUPO] ✅ Foto del grupo establecida`);
                     grupoInfo.imagenEstablecida = true;
                 } catch (picError) {
-                    console.error(`[GRUPO] Error al procesar/establecer imagen:`, picError);
-                    
-                    // Si sharp falla, intentar con la imagen original
-                    if (picError.message.includes('sharp') || picError.message.includes('processing')) {
-                        console.log(`[GRUPO] Intentando con imagen original sin procesar...`);
-                        try {
-                            await sock.updateProfilePicture(grupoId, imageBuffer);
-                            console.log(`[GRUPO] ✅ Foto del grupo establecida (sin procesar)`);
-                            grupoInfo.imagenEstablecida = true;
-                        } catch (fallbackError) {
-                            throw new Error(`Error al establecer foto del grupo: ${fallbackError.message}. Asegúrate de que la imagen sea válida.`);
-                        }
-                    } else {
-                        throw new Error(`Error al establecer foto del grupo: ${picError.message}`);
-                    }
+                    throw new Error(`Error al establecer foto del grupo: ${picError.message}`);
                 }
             } catch (imgError) {
                 console.error(`[GRUPO] ⚠️ Error al establecer imagen:`, imgError);
-                // No fallar la creación del grupo si la imagen falla, pero lo registramos
-                const errorMsg = imgError.message || imgError.toString();
-                grupoInfo.errorImagen = errorMsg;
+                grupoInfo.errorImagen = imgError.message;
                 grupoInfo.imagenEstablecida = false;
+                
                 await sendDiscordNotification('warning', 'Grupo creado pero error con imagen', {
                     'Grupo ID': grupoId,
-                    'Error imagen': errorMsg,
-                    'URL/Base64': imagen.substring(0, 100)
+                    'Error imagen': imgError.message
                 });
             }
         }
@@ -600,7 +617,6 @@ app.post('/crear-grupo', async (req, res) => {
             gruposHistory.pop();
         }
 
-        // Notificar éxito a Discord
         try {
             await sendDiscordNotification('success', 'Grupo creado exitosamente', {
                 'Grupo ID': grupoId,
@@ -609,27 +625,30 @@ app.post('/crear-grupo', async (req, res) => {
             });
         } catch (discordError) {
             console.error('[GRUPO] ⚠️ Error al notificar a Discord:', discordError.message);
-            // No es crítico, continuamos
+        }
+
+        let mensajeRespuesta = 'Grupo creado exitosamente';
+        if (grupoInfo.errorImagen) {
+            mensajeRespuesta += '. Nota: Hubo un problema al establecer la imagen.';
         }
 
         res.json({ 
             success: true, 
-            message: 'Grupo creado exitosamente',
+            message: mensajeRespuesta,
             grupoId: grupoId,
             participantesAgregados: numerosValidos.length,
-            numerosInvalidos: numerosInvalidos.length > 0 ? numerosInvalidos : undefined
+            numerosInvalidos: numerosInvalidos.length > 0 ? numerosInvalidos : undefined,
+            imagenEstablecida: grupoInfo.imagenEstablecida || false,
+            errorImagen: grupoInfo.errorImagen || undefined
         });
 
     } catch (error) {
         console.error('[GRUPO] ❌ Error al crear grupo:', error);
         
-        // Intentar notificar a Discord, pero no fallar si no se puede
         sendDiscordNotification('error', 'Error al crear grupo', {
             'Error': error.message,
             'Stack': error.stack?.substring(0, 200)
-        }).catch(discordErr => {
-            console.error('[GRUPO] ⚠️ Error al notificar a Discord:', discordErr.message);
-        });
+        }).catch(err => console.error('[GRUPO] Error Discord:', err.message));
 
         res.status(500).json({ 
             success: false, 
@@ -1080,7 +1099,6 @@ app.get('/grupos', async (req, res) => {
         </div>
 
         <script>
-            // Función para mostrar alertas
             function showAlert(message, type = 'success') {
                 const alertContainer = document.getElementById('alertContainer');
                 const alert = document.createElement('div');
@@ -1093,7 +1111,6 @@ app.get('/grupos', async (req, res) => {
                 }, 5000);
             }
 
-            // Función para cargar grupos
             async function cargarGrupos() {
                 try {
                     const response = await fetch('/api/grupos');
@@ -1170,7 +1187,6 @@ app.get('/grupos', async (req, res) => {
                 }
             }
 
-            // Manejar envío del formulario
             document.getElementById('crearGrupoForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
 
@@ -1183,7 +1199,6 @@ app.get('/grupos', async (req, res) => {
                     return;
                 }
 
-                // Convertir texto a array de números
                 const numeros = numerosText
                     .split('\\n')
                     .map(num => num.trim())
@@ -1233,10 +1248,7 @@ app.get('/grupos', async (req, res) => {
                 }
             });
 
-            // Cargar grupos al inicio
             cargarGrupos();
-
-            // Actualizar cada 5 segundos
             setInterval(cargarGrupos, 5000);
         </script>
     </body>
@@ -1278,7 +1290,7 @@ app.get('/qr', async (req, res) => {
             }
 
             .container {
-                max-width: 1200px;
+                max-width: 1400px;
                 margin: 0 auto;
             }
 
@@ -1301,9 +1313,15 @@ app.get('/qr', async (req, res) => {
 
             .dashboard {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+                grid-template-columns: 400px 1fr;
                 gap: 20px;
                 margin-bottom: 20px;
+            }
+
+            @media (max-width: 1200px) {
+                .dashboard {
+                    grid-template-columns: 1fr;
+                }
             }
 
             .card {
@@ -1410,7 +1428,7 @@ app.get('/qr', async (req, res) => {
             }
 
             .messages-list {
-                max-height: 400px;
+                max-height: 600px;
                 overflow-y: auto;
                 margin-top: 15px;
             }
@@ -1421,6 +1439,12 @@ app.get('/qr', async (req, res) => {
                 border-radius: 8px;
                 margin-bottom: 10px;
                 border-left: 4px solid #667eea;
+                transition: all 0.3s ease;
+            }
+
+            .message-item:hover {
+                background: #e5e7eb;
+                transform: translateX(5px);
             }
 
             .message-item.error {
@@ -1428,30 +1452,61 @@ app.get('/qr', async (req, res) => {
                 background: #fee2e2;
             }
 
-            .message-item .message-number {
+            .message-item.enviado {
+                border-left-color: #10b981;
+            }
+
+            .message-item.entregado {
+                border-left-color: #059669;
+            }
+
+            .message-item.leido {
+                border-left-color: #047857;
+                background: #d1fae5;
+            }
+
+            .message-item.enviando {
+                border-left-color: #f59e0b;
+                background: #fef3c7;
+            }
+
+            .message-item.en_cola {
+                border-left-color: #6b7280;
+            }
+
+            .message-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 10px;
+            }
+
+            .message-number {
                 font-weight: bold;
                 color: #667eea;
-                margin-bottom: 5px;
+                font-size: 1.1em;
             }
 
-            .message-item .message-text {
-                color: #4b5563;
-                margin-bottom: 5px;
-                font-size: 0.9em;
-            }
-
-            .message-item .message-time {
-                color: #9ca3af;
-                font-size: 0.8em;
-            }
-
-            .message-item .message-status {
-                display: inline-block;
-                padding: 3px 8px;
-                border-radius: 12px;
-                font-size: 0.75em;
+            .message-status-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                padding: 5px 12px;
+                border-radius: 20px;
+                font-size: 0.85em;
                 font-weight: bold;
-                margin-top: 5px;
+                background: white;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+
+            .status-en_cola {
+                background: #e5e7eb;
+                color: #374151;
+            }
+
+            .status-enviando {
+                background: #fef3c7;
+                color: #92400e;
             }
 
             .status-enviado {
@@ -1459,15 +1514,66 @@ app.get('/qr', async (req, res) => {
                 color: #065f46;
             }
 
+            .status-entregado {
+                background: #a7f3d0;
+                color: #047857;
+            }
+
+            .status-leido {
+                background: #6ee7b7;
+                color: #064e3b;
+            }
+
             .status-error {
                 background: #fee2e2;
                 color: #991b1b;
             }
 
+            .status-reintentando {
+                background: #fed7aa;
+                color: #9a3412;
+            }
+
+            .message-text {
+                color: #4b5563;
+                margin: 8px 0;
+                font-size: 0.95em;
+                line-height: 1.4;
+            }
+
+            .message-footer {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-top: 10px;
+                padding-top: 10px;
+                border-top: 1px solid rgba(0,0,0,0.1);
+            }
+
+            .message-time {
+                color: #9ca3af;
+                font-size: 0.8em;
+            }
+
+            .message-id {
+                color: #9ca3af;
+                font-size: 0.75em;
+                font-family: monospace;
+            }
+
+            .message-error {
+                color: #ef4444;
+                font-size: 0.85em;
+                margin-top: 8px;
+                padding: 8px;
+                background: white;
+                border-radius: 5px;
+            }
+
             .info-item {
                 display: flex;
                 justify-content: space-between;
-                padding: 10px 0;
+                padding: 12px 0;
                 border-bottom: 1px solid #e5e7eb;
             }
 
@@ -1488,6 +1594,7 @@ app.get('/qr', async (req, res) => {
                 text-align: center;
                 color: #6b7280;
                 font-style: italic;
+                padding: 20px;
             }
 
             .actions {
@@ -1498,13 +1605,73 @@ app.get('/qr', async (req, res) => {
                 margin-top: 20px;
             }
 
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+
+            .stat-card {
+                background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                transition: transform 0.3s ease;
+            }
+
+            .stat-card:hover {
+                transform: scale(1.05);
+            }
+
+            .stat-number {
+                font-size: 2em;
+                font-weight: bold;
+                color: #667eea;
+                margin-bottom: 5px;
+            }
+
+            .stat-label {
+                color: #6b7280;
+                font-size: 0.9em;
+            }
+
+            .filter-buttons {
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+                margin-bottom: 15px;
+            }
+
+            .filter-btn {
+                padding: 8px 16px;
+                border: 2px solid #e5e7eb;
+                background: white;
+                border-radius: 8px;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                font-size: 0.9em;
+                font-weight: 500;
+            }
+
+            .filter-btn:hover {
+                border-color: #667eea;
+                color: #667eea;
+            }
+
+            .filter-btn.active {
+                background: #667eea;
+                color: white;
+                border-color: #667eea;
+            }
+
             @media (max-width: 768px) {
-                .dashboard {
-                    grid-template-columns: 1fr;
-                }
-                
                 .header h1 {
                     font-size: 1.8em;
+                }
+                
+                .stats-grid {
+                    grid-template-columns: repeat(2, 1fr);
                 }
             }
         </style>
@@ -1513,52 +1680,96 @@ app.get('/qr', async (req, res) => {
         <div class="container">
             <div class="header">
                 <h1>🤖 WhatsApp Bot Dashboard</h1>
-                <p>Panel de control y monitoreo</p>
+                <p>Panel de control y monitoreo avanzado</p>
             </div>
 
             <div class="dashboard">
-                <!-- Card de Conexión -->
+                <!-- Sidebar: Conexión y Sistema -->
+                <div>
+                    <!-- Card de Conexión -->
+                    <div class="card" style="margin-bottom: 20px;">
+                        <h2>
+                            <span class="status-indicator ${botConectado ? 'status-connected' : (lastQR ? 'status-waiting' : 'status-disconnected')}"></span>
+                            Estado de Conexión
+                        </h2>
+                        
+                        ${botConectado ? `
+                            <div class="connected-info">
+                                <h3>✅ Conectado</h3>
+                                <p style="margin-top: 10px; font-size: 0.9em;">Usuario: <strong>${sock.user.id}</strong></p>
+                            </div>
+                        ` : (lastQR ? `
+                            <div class="qr-container">
+                                <p style="color: #f59e0b; font-weight: bold; margin-bottom: 15px;">📱 Escanea el código QR</p>
+                                <img src="${qrImage}" alt="QR Code" />
+                                <p style="color: #6b7280; margin-top: 15px; font-size: 0.9em;">Abre WhatsApp y escanea este código</p>
+                            </div>
+                        ` : `
+                            <div class="loading">
+                                <p>⏳ Generando código QR...</p>
+                                <p style="margin-top: 10px; font-size: 0.9em;">Por favor espera unos segundos</p>
+                            </div>
+                        `)}
+
+                        <div class="actions">
+                            <button class="btn btn-danger" onclick="limpiarSesion()">🗑️ Limpiar Sesión</button>
+                            <button class="btn btn-primary" onclick="location.reload()">🔄 Actualizar</button>
+                        </div>
+                    </div>
+
+                    <!-- Card de Estado del Sistema -->
+                    <div class="card">
+                        <h2>📊 Estado del Sistema</h2>
+                        <div id="systemStatus">
+                            <div class="loading">Cargando información...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Main: Mensajes -->
                 <div class="card">
-                    <h2>
-                        <span class="status-indicator ${botConectado ? 'status-connected' : (lastQR ? 'status-waiting' : 'status-disconnected')}"></span>
-                        Estado de Conexión
-                    </h2>
+                    <h2>📨 Historial de Mensajes</h2>
                     
-                    ${botConectado ? `
-                        <div class="connected-info">
-                            <h3>✅ Conectado</h3>
-                            <p style="margin-top: 10px; font-size: 0.9em;">Usuario: <strong>${sock.user.id}</strong></p>
+                    <!-- Estadísticas -->
+                    <div class="stats-grid" id="statsGrid">
+                        <div class="stat-card">
+                            <div class="stat-number" id="statTotal">0</div>
+                            <div class="stat-label">Total</div>
                         </div>
-                    ` : (lastQR ? `
-                        <div class="qr-container">
-                            <p style="color: #f59e0b; font-weight: bold; margin-bottom: 15px;">📱 Escanea el código QR</p>
-                            <img src="${qrImage}" alt="QR Code" />
-                            <p style="color: #6b7280; margin-top: 15px; font-size: 0.9em;">Abre WhatsApp y escanea este código</p>
+                        <div class="stat-card">
+                            <div class="stat-number" id="statEnviados">0</div>
+                            <div class="stat-label">✅ Enviados</div>
                         </div>
-                    ` : `
-                        <div class="loading">
-                            <p>⏳ Generando código QR...</p>
-                            <p style="margin-top: 10px; font-size: 0.9em;">Por favor espera unos segundos</p>
+                        <div class="stat-card">
+                            <div class="stat-number" id="statEntregados">0</div>
+                            <div class="stat-label">✅✅ Entregados</div>
                         </div>
-                    `)}
-
-                    <div class="actions">
-                        <button class="btn btn-danger" onclick="limpiarSesion()">🗑️ Limpiar Sesión</button>
-                        <button class="btn btn-primary" onclick="location.reload()">🔄 Actualizar</button>
+                        <div class="stat-card">
+                            <div class="stat-number" id="statLeidos">0</div>
+                            <div class="stat-label">✅✅✅ Leídos</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number" id="statCola">0</div>
+                            <div class="stat-label">⏳ En Cola</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number" id="statErrores">0</div>
+                            <div class="stat-label">❌ Errores</div>
+                        </div>
                     </div>
-                </div>
 
-                <!-- Card de Estado del Sistema -->
-                <div class="card">
-                    <h2>📊 Estado del Sistema</h2>
-                    <div id="systemStatus">
-                        <div class="loading">Cargando información...</div>
+                    <!-- Filtros -->
+                    <div class="filter-buttons">
+                        <button class="filter-btn active" onclick="filtrarMensajes('todos')">Todos</button>
+                        <button class="filter-btn" onclick="filtrarMensajes('en_cola')">⏳ En Cola</button>
+                        <button class="filter-btn" onclick="filtrarMensajes('enviando')">📤 Enviando</button>
+                        <button class="filter-btn" onclick="filtrarMensajes('enviado')">✅ Enviados</button>
+                        <button class="filter-btn" onclick="filtrarMensajes('entregado')">✅✅ Entregados</button>
+                        <button class="filter-btn" onclick="filtrarMensajes('leido')">✅✅✅ Leídos</button>
+                        <button class="filter-btn" onclick="filtrarMensajes('error')">❌ Errores</button>
                     </div>
-                </div>
 
-                <!-- Card de Últimos Mensajes -->
-                <div class="card" style="grid-column: span 1;">
-                    <h2>📨 Últimos Mensajes</h2>
+                    <!-- Lista de mensajes -->
                     <div id="messagesList">
                         <div class="loading">Cargando mensajes...</div>
                     </div>
@@ -1567,6 +1778,8 @@ app.get('/qr', async (req, res) => {
         </div>
 
         <script>
+            let filtroActual = 'todos';
+
             async function limpiarSesion() {
                 if (!confirm('¿Estás seguro de que quieres limpiar la sesión? Deberás escanear un nuevo QR.')) {
                     return;
@@ -1624,25 +1837,49 @@ app.get('/qr', async (req, res) => {
 
                     if (data.mensajes.length === 0) {
                         document.getElementById('messagesList').innerHTML = '<div class="loading">No hay mensajes aún</div>';
+                        actualizarEstadisticas([]);
                         return;
                     }
 
-                    const messagesHtml = data.mensajes.slice(0, 10).map(msg => \`
-                        <div class="message-item \${msg.status === 'error' ? 'error' : ''}">
-                            <div class="message-number">📱 \${msg.numero}</div>
+                    // Actualizar estadísticas
+                    actualizarEstadisticas(data.mensajes);
+
+                    // Filtrar mensajes
+                    const mensajesFiltrados = filtroActual === 'todos' 
+                        ? data.mensajes 
+                        : data.mensajes.filter(msg => msg.status === filtroActual);
+
+                    if (mensajesFiltrados.length === 0) {
+                        document.getElementById('messagesList').innerHTML = '<div class="loading">No hay mensajes con este filtro</div>';
+                        return;
+                    }
+
+                    const messagesHtml = mensajesFiltrados.slice(0, 50).map(msg => \`
+                        <div class="message-item \${msg.status}">
+                            <div class="message-header">
+                                <div class="message-number">📱 \${msg.numero}</div>
+                                <span class="message-status-badge status-\${msg.status}">
+                                    \${msg.statusIcon} \${msg.statusText}
+                                </span>
+                            </div>
                             <div class="message-text">\${msg.texto}</div>
-                            <div class="message-time">🕐 \${new Date(msg.timestamp).toLocaleString('es-AR')}</div>
-                            <span class="message-status status-\${msg.status}">
-                                \${msg.status === 'enviado' ? '✅ Enviado' : '❌ Error'}
-                            </span>
-                            \${msg.error ? \`<div style="color: #ef4444; font-size: 0.8em; margin-top: 5px;">\${msg.error}</div>\` : ''}
+                            <div class="message-footer">
+                                <div class="message-time">🕐 \${new Date(msg.timestamp).toLocaleString('es-AR')}</div>
+                                \${msg.messageId ? \`<div class="message-id">ID: \${msg.messageId.substring(0, 15)}...</div>\` : ''}
+                            </div>
+                            \${msg.error ? \`<div class="message-error">⚠️ \${msg.error}</div>\` : ''}
+                            \${msg.lastUpdate && msg.lastUpdate !== msg.timestamp ? \`
+                                <div style="color: #6b7280; font-size: 0.75em; margin-top: 5px;">
+                                    Última actualización: \${new Date(msg.lastUpdate).toLocaleString('es-AR')}
+                                </div>
+                            \` : ''}
                         </div>
                     \`).join('');
 
                     document.getElementById('messagesList').innerHTML = \`
                         <div class="messages-list">\${messagesHtml}</div>
                         <p style="text-align: center; color: #6b7280; margin-top: 15px; font-size: 0.9em;">
-                            Mostrando \${Math.min(10, data.mensajes.length)} de \${data.total} mensajes
+                            Mostrando \${Math.min(50, mensajesFiltrados.length)} de \${mensajesFiltrados.length} mensajes filtrados (\${data.total} total)
                         </p>
                     \`;
                 } catch (error) {
@@ -1650,37 +1887,49 @@ app.get('/qr', async (req, res) => {
                 }
             }
 
+            function actualizarEstadisticas(mensajes) {
+                const stats = {
+                    total: mensajes.length,
+                    enviado: mensajes.filter(m => m.status === 'enviado').length,
+                    entregado: mensajes.filter(m => m.status === 'entregado').length,
+                    leido: mensajes.filter(m => m.status === 'leido').length,
+                    en_cola: mensajes.filter(m => m.status === 'en_cola' || m.status === 'enviando').length,
+                    error: mensajes.filter(m => m.status === 'error').length
+                };
+
+                document.getElementById('statTotal').textContent = stats.total;
+                document.getElementById('statEnviados').textContent = stats.enviado;
+                document.getElementById('statEntregados').textContent = stats.entregado;
+                document.getElementById('statLeidos').textContent = stats.leido;
+                document.getElementById('statCola').textContent = stats.en_cola;
+                document.getElementById('statErrores').textContent = stats.error;
+            }
+
+            function filtrarMensajes(filtro) {
+                filtroActual = filtro;
+                
+                // Actualizar botones activos
+                document.querySelectorAll('.filter-btn').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+                event.target.classList.add('active');
+                
+                cargarMensajes();
+            }
+
             // Cargar datos iniciales
             cargarEstadoSistema();
             cargarMensajes();
 
-            // Actualizar cada 5 segundos
+            // Actualizar cada 3 segundos
             setInterval(() => {
                 cargarEstadoSistema();
                 cargarMensajes();
-            }, 5000);
+            }, 3000);
         </script>
     </body>
     </html>
     `;
 
     res.send(html);
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', connected: !!sock?.user });
-});
-
-app.get('/', (req, res) => res.redirect('/qr'));
-
-// --- Iniciar servidor y bot ---
-app.listen(port, async () => {
-    console.log(`🚀 Servidor Express en puerto ${port}`);
-    
-    await sendDiscordNotification('info', 'Servidor iniciado', {
-        'Puerto': port,
-        'Timestamp': new Date().toISOString()
-    });
-    
-    startBot();
 });
